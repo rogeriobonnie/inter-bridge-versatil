@@ -1,137 +1,111 @@
-// server.js — versão corrigida (usa mTLS só nas requisições para o Inter)
-import express from "express";
-import https from "https";
-import axios from "axios";
-import qs from "qs";
+// server.js — Inter Bridge Versão Corrigida ✅
+
+require("dotenv").config();
+const express = require("express");
+const https = require("https");
+const { Buffer } = require("buffer");
+const fetch = require("node-fetch");
 
 const app = express();
 app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 
-// CONFIG (via env)
-const INTER_BASE_URL = process.env.INTER_BASE_URL || "https://cdpj.partners.bancointer.com.br";
-const INTER_CLIENT_ID = process.env.INTER_CLIENT_ID || "";
-const INTER_CLIENT_SECRET = process.env.INTER_CLIENT_SECRET || "";
-const certB64 = process.env.INTER_CERT_B64 || "";
-const keyB64 = process.env.INTER_KEY_B64 || "";
+// Variáveis de ambiente
+const INTER_CERT_B64 = process.env.INTER_CERT_B64;
+const INTER_KEY_B64 = process.env.INTER_KEY_B64;
+const INTER_CLIENT_ID = process.env.INTER_CLIENT_ID;
+const INTER_CLIENT_SECRET = process.env.INTER_CLIENT_SECRET;
 
-// validação mínima
-if (!certB64 || !keyB64) {
-  console.warn("ATENÇÃO: INTER_CERT_B64 ou INTER_KEY_B64 não configuradas nas env vars");
-}
+const INTER_API_URL = "https://cdpj.partners.bancointer.com.br";
 
-// monta https.Agent com mTLS — usado APENAS nas chamadas para o Inter
-const interHttpsAgent = new https.Agent({
-  cert: certB64 ? Buffer.from(certB64, "base64") : undefined,
-  key: keyB64 ? Buffer.from(keyB64, "base64") : undefined,
-  // Não colocar rejectUnauthorized:false aqui — queremos validar o certificado do Inter:
+// Decodifica certificado e chave da variável Base64
+const cert = INTER_CERT_B64 ? Buffer.from(INTER_CERT_B64, "base64") : null;
+const key = INTER_KEY_B64 ? Buffer.from(INTER_KEY_B64, "base64") : null;
+
+// Agente HTTPS configurado com mTLS
+const agent = new https.Agent({
+  cert,
+  key,
   rejectUnauthorized: true,
-  keepAlive: true,
 });
 
-/**
- * Faz uma requisição ao servidor do Inter usando o agente TLS.
- * method: 'get'|'post'...
- * path: caminho a partir de INTER_BASE_URL (ex: '/oauth/v2/token' ou '/api/v2/cobrancas')
- * data: objeto ou string (se for form-urlencoded, passe string)
- * extraHeaders: headers adicionais
- * responseType: optional (e.g. 'arraybuffer' para PDFs)
- */
-async function callInter(method, path, data = null, extraHeaders = {}, responseType = "json") {
-  const url = `${INTER_BASE_URL}${path}`;
-  try {
-    const resp = await axios.request({
-      method,
-      url,
-      data,
-      headers: extraHeaders,
-      httpsAgent: interHttpsAgent,
-      timeout: 30000,
-      responseType,
-      validateStatus: () => true, // retornar body mesmo para códigos >=400 para debug
-    });
-    return resp;
-  } catch (err) {
-    // erro de baixo nível (ex: TLS, network). normal log e rethrow
-    console.error("Erro low-level ao chamar Inter:", err?.message || err);
-    throw err;
-  }
-}
-
-/**
- * Endpoint: POST /oauth/token
- * Proxy para o Inter (form-urlencoded)
- */
+// ✅ 1️⃣ Obter Token OAuth
 app.post("/oauth/token", async (req, res) => {
   try {
-    // Prepara body x-www-form-urlencoded — se client_id/secret vierem por env, usamos elas
-    const payloadObj = {
+    const payload = {
       grant_type: "client_credentials",
-      client_id: INTER_CLIENT_ID || req.body.client_id,
-      client_secret: INTER_CLIENT_SECRET || req.body.client_secret,
-      scope: req.body.scope || "oapi",
+      client_id: req.body.client_id || INTER_CLIENT_ID,
+      client_secret: req.body.client_secret || INTER_CLIENT_SECRET,
+      scope: "boleto-cobranca.read boleto-cobranca.write",
     };
-    const payload = qs.stringify(payloadObj);
 
-    const resp = await callInter("post", "/oauth/v2/token", payload, {
-      "Content-Type": "application/x-www-form-urlencoded",
+    const response = await fetch(`${INTER_API_URL}/oauth/v2/token`, {
+      method: "POST",
+      agent,
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams(payload),
     });
 
-    // devolve o status e body que o Inter retornou
-    res.status(resp.status).send(resp.data);
+    const data = await response.json();
+    return res.json(data);
   } catch (err) {
-    console.error("Erro em /oauth/token:", err?.message || err);
-    res.status(502).json({ error: "Erro ao comunicar com o Inter", detail: err?.message || String(err) });
+    console.error("Erro no token:", err);
+    res.status(500).json({ error: "Erro ao obter token", details: err.message });
   }
 });
 
-/**
- * Endpoint: POST /cobrancas
- * Proxy para criar cobrança (boleto)
- * Espera receber JSON do cliente com o body que o Inter espera.
- */
+// ✅ 2️⃣ Criar Boleto de Cobrança
 app.post("/cobrancas", async (req, res) => {
   try {
-    // Usamos o header Authorization (Bearer) enviado pelo cliente (se houver)
-    const headers = {
-      "Content-Type": "application/json",
-      // repassa Authorization se o cliente enviou
-      ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
-    };
-    const resp = await callInter("post", "/api/v2/cobrancas", req.body, headers, "json");
-    res.status(resp.status).send(resp.data);
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token) return res.status(401).json({ error: "Token inválido" });
+
+    const payload = req.body;
+
+    const response = await fetch(`${INTER_API_URL}/cobranca/v3/cobrancas`, {
+      method: "POST",
+      agent,
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const data = await response.json();
+    return res.json(data);
   } catch (err) {
-    console.error("Erro em /cobrancas:", err?.message || err);
-    res.status(502).json({ error: "Erro ao comunicar com o Inter", detail: err?.message || String(err) });
+    console.error("Erro criando boleto:", err);
+    res.status(500).json({ error: "Erro ao criar cobrança" });
   }
 });
 
-/**
- * Endpoint: GET /cobrancas/:id/pdf
- * Proxy para baixar PDF do boleto (responseType=arraybuffer)
- */
+// ✅ 3️⃣ Buscar PDF do Boleto
 app.get("/cobrancas/:id/pdf", async (req, res) => {
   try {
-    const id = encodeURIComponent(req.params.id);
-    const headers = {
-      ...(req.headers.authorization ? { Authorization: req.headers.authorization } : {}),
-      Accept: "application/pdf",
-    };
-    const resp = await callInter("get", `/api/v2/cobrancas/${id}/pdf`, null, headers, "arraybuffer");
+    const token = req.headers.authorization?.replace("Bearer ", "");
+    if (!token) return res.status(401).json({ error: "Token inválido" });
 
-    // Se o Inter retornou PDF, repassamos como aplicação/pdf
-    const contentType = resp.headers["content-type"] || "";
-    if (contentType.includes("pdf") || resp.data instanceof Buffer) {
-      res.setHeader("Content-Type", "application/pdf");
-      res.status(resp.status).send(Buffer.from(resp.data));
-    } else {
-      // Se não for PDF, devolve JSON/texto de erro
-      res.status(resp.status).send(resp.data);
-    }
+    const { id } = req.params;
+
+    const response = await fetch(`${INTER_API_URL}/cobranca/v3/cobrancas/${id}/pdf`, {
+      method: "GET",
+      agent,
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    const buffer = await response.buffer();
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.send(buffer);
   } catch (err) {
-    console.error("Erro em /cobrancas/:id/pdf:", err?.message || err);
-    res.status(502).json({ error: "Erro ao comunicar com o Inter", detail: err?.message || String(err) });
+    console.error("Erro no PDF:", err);
+    res.status(500).json({ error: "Erro ao baixar boleto" });
   }
 });
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Inter Bridge rodando na porta ${PORT}`));
+// ✅ Inicialização
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => {
+  console.log(`✅ Inter Bridge rodando na porta ${PORT}`);
+});
