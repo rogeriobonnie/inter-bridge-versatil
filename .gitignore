@@ -1,0 +1,8 @@
+
+node_modules/
+*.crt
+*.key
+*.pem
+cert.b64.txt
+key.b64.txt
+.env
